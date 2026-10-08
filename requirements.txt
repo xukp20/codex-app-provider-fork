@@ -1,0 +1,2 @@
+# Only required for the Unix daemon transport. Stdio uses the standard library.
+websockets>=14,<17

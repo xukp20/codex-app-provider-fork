@@ -1,0 +1,4 @@
+interface:
+  display_name: "Provider Fork"
+  short_description: "Fork Codex tasks across providers and set defaults"
+  default_prompt: "Use $provider-fork to switch the requested task to another provider through a new fork, preserving its source and official login."

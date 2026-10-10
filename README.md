@@ -236,6 +236,8 @@ current configuration is Full Access. Simply omitting the RPC permission
 fields can restore the source's saved settings instead. If that native
 behavior is desired, use `--permission-mode inherit`; sandbox/profile
 restoration depends on what was saved and the server version.
+For summary handoff, `inherit` omits overrides on native `thread/start`, so
+it uses fresh defaults rather than source-history permissions.
 
 Explicit options are supported for both fork and exceptional handoff:
 

@@ -494,7 +494,7 @@ def main():
     handoff.add_argument('--request-id')
     for command in (branch, handoff):
         command.add_argument('--permission-mode', choices=['config', 'inherit'], default='config',
-                             help='Use current effective config (default), or native source inheritance')
+                             help='Use current effective config (default), or native API inheritance')
         group = command.add_mutually_exclusive_group()
         group.add_argument('--sandbox', choices=SANDBOX_TYPES)
         group.add_argument('--permission-profile', help='Named permission profile, where supported by the server')

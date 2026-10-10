@@ -216,6 +216,8 @@ Provider 切换与权限选择相互独立。默认的 `--permission-mode config
 审批策略传给新分支。仅省略 RPC 的权限字段可能恢复源会话的已保存设置。
 如果希望采用这种原生行为，使用 `--permission-mode inherit`；sandbox/profile
 的恢复取决于已保存的数据和服务器版本。
+摘要 handoff 的 `inherit` 则是不覆盖原生 `thread/start` 的权限，因此采用新会话
+默认值，而不是源历史的权限。
 
 fork 和异常情况下的 handoff 都支持显式选项：
 

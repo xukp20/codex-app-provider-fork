@@ -63,14 +63,15 @@ class ProviderForkTests(unittest.TestCase):
                                    'items': [{'encrypted_content': 'fake-opaque-state'}]}]}}
                 if method == 'thread/fork':
                     self.asserted_provider = params['modelProvider']
-                    return {'modelProvider': 'beeapi', 'thread': {'id': 'new-fork'}}
+                    return {'modelProvider': 'beeapi', 'thread': {'id': 'new-fork'},
+                            'approvalPolicy': 'never', 'sandbox': {'type': 'dangerFullAccess'}}
                 if method == 'thread/name/set': return {}
                 if method == 'thread/read': return {'thread': {'modelProvider': 'beeapi'}}
                 raise AssertionError('Unexpected API call: '+method)
         for mode in ('legacy', 'paginated'):
             rpc = ForkRpc(mode)
             with patch.object(mod, 'validate_provider', return_value={'model': 'gpt-6.1-sol'}):
-                result = mod.fork(rpc, 'source', 'beeapi')
+                result = mod.fork(rpc, 'source', 'beeapi', permission_mode='inherit')
             self.assertTrue(result['verified']); self.assertTrue(result['opaqueHistoryDetected'])
             self.assertEqual(rpc.asserted_provider, 'beeapi')
             self.assertEqual(rpc.methods, ['thread/read', 'thread/fork', 'thread/name/set', 'thread/read'])
@@ -87,7 +88,7 @@ class ProviderForkTests(unittest.TestCase):
         rpc = FailedForkRpc()
         with patch.object(mod, 'validate_provider', return_value={}):
             with self.assertRaisesRegex(RuntimeError, 'Native fork rejected'):
-                mod.fork(rpc, 'source', 'beeapi')
+                mod.fork(rpc, 'source', 'beeapi', permission_mode='inherit')
         self.assertEqual(rpc.methods, ['thread/read', 'thread/fork'])
 
     @unittest.skipUnless(os.environ.get("PROVIDER_FORK_NATIVE_TESTS") == "1",
@@ -119,7 +120,8 @@ class ProviderForkTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temp:
                 home = Path(temp).resolve(); mod.HOME = home; os.environ['CODEX_HOME'] = str(home)
-                text = 'model="gpt-6.1-sol"\nmodel_provider="openai"\nmodel_reasoning_effort="low"\n'
+                text = ('model="gpt-6.1-sol"\nmodel_provider="openai"\nmodel_reasoning_effort="low"\n'
+                        'sandbox_mode="danger-full-access"\napproval_policy="never"\n')
                 for provider in ('beeapi', 'krill-code'):
                     text += f'\n[model_providers.{provider}]\nname="{provider}"\nbase_url="http://127.0.0.1:{server.server_port}/{provider}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nexperimental_bearer_token="test-only-{provider}"\n'
                 (home/'config.toml').write_text(text)
@@ -127,7 +129,7 @@ class ProviderForkTests(unittest.TestCase):
                 (home/'auth.json').write_text(json.dumps(auth))
                 hashes = {p: hashlib.sha256((home/p).read_bytes()).hexdigest() for p in ('config.toml', 'auth.json')}
                 with mod.Rpc('stdio') as rpc:
-                    started = rpc.request('thread/start', {'modelProvider': 'beeapi', 'cwd': str(home), 'sandbox': 'read-only', 'approvalPolicy': 'never'})
+                    started = rpc.request('thread/start', {'modelProvider': 'beeapi', 'cwd': str(home), 'sandbox': 'read-only', 'approvalPolicy': 'on-request'})
                     parent = mod.verify(started, 'beeapi')
                     turn = mod.run_turn(rpc, parent, '17*19. No tools.', timeout=30)
                     self.assertEqual(turn['status'], 'completed')
@@ -137,13 +139,31 @@ class ProviderForkTests(unittest.TestCase):
                         child = mod.fork(rpc, parent, 'krill-code', last_turn=turn['turnId'])
                     child_id = child['threadId']
                     self.assertTrue(child['verified'])
-                    turn2 = mod.run_turn(rpc, child_id, 'Repeat the previous result. No tools.', timeout=30)
-                    self.assertEqual(turn2['status'], 'completed')
+                    self.assertTrue(child['permissionsVerified'])
+                    self.assertEqual(child['effectivePermissions']['approvalPolicy'], 'never')
+                    self.assertEqual(child['effectivePermissions']['sandbox']['type'], 'dangerFullAccess')
+                    with patch.object(mod, 'validate_provider', return_value=mod.settings()):
+                        inherited = mod.fork(rpc, parent, 'krill-code', permission_mode='inherit')
+                        bounded = mod.fork(rpc, parent, 'krill-code', sandbox='read-only', approval_policy='never')
+                        profiled = mod.fork(rpc, parent, 'krill-code', permission_profile=':workspace', approval_policy='never')
+                    self.assertEqual(inherited['effectivePermissions']['approvalPolicy'], 'on-request')
+                    # Native omission restores saved approvals, while sandbox restoration
+                    # depends on saved profile provenance and the server version.
+                    self.assertEqual(bounded['effectivePermissions']['approvalPolicy'], 'never')
+                    self.assertEqual(bounded['effectivePermissions']['sandbox']['type'], 'readOnly')
+                    self.assertEqual(profiled['effectivePermissions']['activePermissionProfile']['id'], ':workspace')
+                    source_permissions = rpc.request('thread/resume', {'threadId': parent, 'excludeTurns': True})
+                    self.assertEqual(source_permissions['approvalPolicy'], 'on-request')
+                    self.assertEqual(source_permissions['sandbox']['type'], 'readOnly')
                     self.assertEqual(rpc.request('thread/read', {'threadId': parent, 'includeTurns': False})['thread']['modelProvider'], 'beeapi')
-                # New process must recover child provider without an explicit provider override.
+                # Cold resume before the fork's first turn must also retain its permissions.
                 with mod.Rpc('stdio') as rpc:
                     reopened = rpc.request('thread/resume', {'threadId': child_id, 'excludeTurns': True})
                     self.assertEqual(reopened['modelProvider'], 'krill-code')
+                    self.assertEqual(reopened['approvalPolicy'], 'never')
+                    self.assertEqual(reopened['sandbox']['type'], 'dangerFullAccess')
+                    turn2 = mod.run_turn(rpc, child_id, 'Repeat the previous result. No tools.', timeout=30)
+                    self.assertEqual(turn2['status'], 'completed')
                     rpc.request('thread/inject_items', {'threadId': child_id, 'items': [{'type': 'message', 'role': 'user',
                         'content': [{'type': 'input_text', 'text': 'HANDOFF_PERSISTENCE_SENTINEL_742'}]}]})
                 with mod.Rpc('stdio') as rpc:

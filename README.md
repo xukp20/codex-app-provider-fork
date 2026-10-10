@@ -221,6 +221,47 @@ A separate stdio process cannot take over a thread held by another writer.
 If a writer lock is reported, inspect the owning server and use its available
 transport. The helper never restarts the App or daemon to release a lock.
 
+### Permissions
+
+Provider switching and permission selection are independent. The default
+`--permission-mode config` uses the current effective configuration in the
+source working directory, including project layers, named profiles, granular
+approval policies, and managed restrictions. The server resolves it through
+a fresh ephemeral thread, which is unsubscribed immediately, stores no task
+history, and starts no inference. The helper explicitly applies the resulting
+settings to the new fork and verifies the effective response.
+
+This avoids carrying an old `on-request` approval policy into a fork when the
+current configuration is Full Access. Simply omitting the RPC permission
+fields can restore the source's saved settings instead. If that native
+behavior is desired, use `--permission-mode inherit`; sandbox/profile
+restoration depends on what was saved and the server version.
+
+Explicit options are supported for both fork and exceptional handoff:
+
+```bash
+python skills/provider-fork/scripts/provider_fork.py fork \
+  --thread THREAD_ID --provider krill --sandbox danger-full-access \
+  --approval-policy never --request-id full-access-switch-001
+python skills/provider-fork/scripts/provider_fork.py fork \
+  --thread THREAD_ID --provider beeapi --sandbox read-only \
+  --approval-policy never --request-id readonly-switch-001
+```
+
+`--permission-profile PROFILE_ID` selects a named permission profile instead
+of `--sandbox`; those two options are mutually exclusive. Explicit options
+take precedence over the selected permission mode and remain subject to
+server restrictions. The receipt includes `requestedPermissions`,
+`effectivePermissions`, and `permissionsVerified`. Check both the sandbox
+and approval policy: [Full Access](https://learn.chatgpt.com/docs/sandboxing)
+means `danger-full-access` together with `never`. Windows `sandbox = "elevated"`
+chooses the sandbox implementation; it does not set the approval policy.
+
+These options never edit global approval/sandbox settings or change existing
+branches. Previously created branches need a separate permission change.
+Request IDs include permission options; use a new ID when changing them.
+Receipts from older helper versions do not certify effective permissions.
+
 ## Safety Boundaries
 
 - No writes to `auth.json`, official token copies, direct thread JSONL/SQLite
@@ -237,8 +278,8 @@ transport. The helper never restarts the App or daemon to release a lock.
 - Receipts are stored under `$CODEX_HOME/provider-fork/receipts/`. An uncertain
   operation is not automatically retried. A previously successful persistent
   receipt does not overwrite a later intentional default change.
-- New branches use `workspace-write`, approval policy `on-request`, disabled
-  memories, and the default service tier. The helper does not auto-approve
+- New branches use resolved configuration or explicitly selected permissions,
+  disabled memories, and the default service tier. The helper does not auto-approve
   interactive server requests. These permissions are not strong isolation
   against an untrusted model accessing local credential files.
 - Forked history is sent to the selected provider when inference continues.
@@ -290,7 +331,8 @@ PROVIDER_FORK_NATIVE_TESTS=1 python -m unittest discover -s tests -v
 In PowerShell, set `$env:PROVIDER_FORK_NATIVE_TESTS = '1'` before running the
 same unittest command. The native tests cover fork continuation, dedicated
 Authorization headers, config/auth preservation, restart restoration,
-resume overrides, and persistent receipt recovery.
+resume overrides, persistent receipt recovery, Full Access defaults despite
+old source approvals, native inheritance, and explicit restricted/profile settings.
 
 ## Compatibility
 

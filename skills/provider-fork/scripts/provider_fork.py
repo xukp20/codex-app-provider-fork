@@ -329,7 +329,75 @@ def run_turn(rpc, ident, prompt, timeout=120):
     return {'turnId': turn_id, 'status': 'timeout', 'seconds': round(time.monotonic()-before, 2), 'answer': ''.join(chunks), 'events': errors}
 
 
-def fork(rpc, source_id, provider, model=None, last_turn=None, allow_opaque=False):
+SANDBOX_TYPES = {'read-only': 'readOnly', 'workspace-write': 'workspaceWrite',
+                 'danger-full-access': 'dangerFullAccess'}
+
+
+def permission_state(result):
+    if result.get('approvalPolicy') is None or not isinstance(result.get('sandbox'), dict):
+        raise RuntimeError('Server did not return effective approval/sandbox settings')
+    return {key: result[key] for key in ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile')
+            if key in result}
+
+
+def permission_request(rpc, cwd, model, provider, mode, sandbox, approval_policy, permission_profile):
+    """Resolve fresh configuration through the server, without inheriting stale source settings."""
+    if sandbox and permission_profile:
+        raise RuntimeError('Sandbox and permission profile overrides are mutually exclusive')
+    overrides = {}
+    if sandbox is not None:
+        if sandbox not in SANDBOX_TYPES:
+            raise RuntimeError('Unsupported sandbox mode')
+        overrides['sandbox'] = sandbox
+    if approval_policy is not None:
+        overrides['approvalPolicy'] = approval_policy
+    if permission_profile is not None:
+        overrides['permissions'] = permission_profile
+    if mode == 'inherit':
+        return overrides, None
+    if mode != 'config':
+        raise RuntimeError('Unsupported permission mode')
+    # A fresh ephemeral thread lets Codex resolve profiles, project layers, defaults,
+    # granular approvals and managed requirements. It stores no conversation and
+    # starts no turn. Avoid reimplementing this resolution from raw config/read TOML.
+    probe = rpc.request('thread/start', {'cwd': cwd, 'model': model, 'modelProvider': provider,
+        'ephemeral': True, 'config': {'features.memories': False}, 'serviceTier': 'default', **overrides})
+    try:
+        state = permission_state(probe)
+        request = {'approvalPolicy': state['approvalPolicy']}
+        if state.get('approvalsReviewer') is not None:
+            request['approvalsReviewer'] = state['approvalsReviewer']
+        profile = state.get('activePermissionProfile')
+        if profile and profile.get('id'):
+            request['permissions'] = profile['id']
+        else:
+            kinds = {value: key for key, value in SANDBOX_TYPES.items()}
+            kind = state['sandbox'].get('type')
+            if kind not in kinds:
+                raise RuntimeError('Effective permission policy cannot be represented by this server API')
+            request['sandbox'] = kinds[kind]
+        return request, state
+    finally:
+        rpc.request('thread/unsubscribe', {'threadId': probe['thread']['id']})
+
+
+def permission_receipt(result, mode, requested, expected):
+    effective = permission_state(result)
+    if expected is not None and effective != expected:
+        raise RuntimeError('Created branch permissions differ from resolved configuration: ' + result['thread']['id'])
+    for key in ('approvalPolicy', 'approvalsReviewer'):
+        if key in requested and effective.get(key) != requested[key]:
+            raise RuntimeError('Created branch did not honor ' + key + ': ' + result['thread']['id'])
+    if 'sandbox' in requested and effective['sandbox'].get('type') != SANDBOX_TYPES[requested['sandbox']]:
+        raise RuntimeError('Created branch did not honor sandbox: ' + result['thread']['id'])
+    if 'permissions' in requested and (effective.get('activePermissionProfile') or {}).get('id') != requested['permissions']:
+        raise RuntimeError('Created branch did not honor permission profile: ' + result['thread']['id'])
+    return {'permissionMode': mode, 'requestedPermissions': requested,
+            'effectivePermissions': effective, 'permissionsVerified': True}
+
+
+def fork(rpc, source_id, provider, model=None, last_turn=None, allow_opaque=False, *,
+         permission_mode='config', sandbox=None, approval_policy=None, permission_profile=None):
     data = validate_provider(provider)
     source = rpc.request('thread/read', {'threadId': source_id, 'includeTurns': True})['thread']
     turns = source.get('turns', [])
@@ -350,11 +418,15 @@ def fork(rpc, source_id, provider, model=None, last_turn=None, allow_opaque=Fals
     opaque = 'encrypted_content' in encoded or 'encryptedContent' in encoded or 'contextCompaction' in encoded
     # Keep allow_opaque for callers of older helpers; inspection is no longer a gate.
     # An opaque marker or paginated history alone does not demonstrate incompatibility.
-    params = {'threadId': source_id, 'modelProvider': provider, 'model': model or source.get('model') or data.get('model', 'gpt-6.1-sol'),
-              'lastTurnId': last_turn, 'excludeTurns': True, 'sandbox': 'workspace-write', 'approvalPolicy': 'on-request',
-              'config': {'features.memories': False}, 'serviceTier': 'default'}
+    target_model = model or source.get('model') or data.get('model', 'gpt-6.1-sol')
+    requested, expected = permission_request(rpc, source.get('cwd'), target_model, provider,
+        permission_mode, sandbox, approval_policy, permission_profile)
+    params = {'threadId': source_id, 'modelProvider': provider, 'model': target_model,
+              'lastTurnId': last_turn, 'excludeTurns': True,
+              'config': {'features.memories': False}, 'serviceTier': 'default', **requested}
     result = rpc.request('thread/fork', params)
     ident = verify(result, provider)
+    permissions = permission_receipt(result, permission_mode, requested, expected)
     name = title_for(provider, source.get('name') or source.get('preview') or source_id)
     rpc.request('thread/name/set', {'threadId': ident, 'name': name})
     saved = rpc.request('thread/read', {'threadId': ident, 'includeTurns': False})['thread']
@@ -363,7 +435,8 @@ def fork(rpc, source_id, provider, model=None, last_turn=None, allow_opaque=Fals
     return {'threadId': ident, 'sourceThreadId': source_id, 'provider': provider, 'model': result.get('model'),
             'name': name, 'lastTurnId': last_turn, 'opaqueHistoryDetected': opaque,
             'compatibilityAssessment': 'not-tested-until-continuation', 'verified': True,
-            'inferenceStarted': False, 'defaultProvider': data.get('model_provider', 'openai'), 'transport': rpc.transport}
+            'inferenceStarted': False, 'defaultProvider': data.get('model_provider', 'openai'),
+            'transport': rpc.transport, **permissions}
 
 
 def status():
@@ -376,15 +449,19 @@ def status():
             'providers': list(LABELS), 'home': str(HOME)}
 
 
-def handoff_thread(rpc, source_id, provider, summary, model=None):
+def handoff_thread(rpc, source_id, provider, summary, model=None, *,
+                   permission_mode='config', sandbox=None, approval_policy=None, permission_profile=None):
     data = validate_provider(provider)
     if not summary.strip() or len(summary) > 100000:
         raise RuntimeError('Summary must be nonempty and at most 100000 characters')
     source = rpc.request('thread/read', {'threadId': source_id, 'includeTurns': False})['thread']
-    result = rpc.request('thread/start', {'modelProvider': provider, 'model': model or source.get('model') or data.get('model', 'gpt-6.1-sol'),
-        'cwd': source['cwd'], 'sandbox': 'workspace-write', 'approvalPolicy': 'on-request', 'serviceTier': 'default',
-        'config': {'features.memories': False}})
+    target_model = model or source.get('model') or data.get('model', 'gpt-6.1-sol')
+    requested, expected = permission_request(rpc, source['cwd'], target_model, provider,
+        permission_mode, sandbox, approval_policy, permission_profile)
+    result = rpc.request('thread/start', {'modelProvider': provider, 'model': target_model,
+        'cwd': source['cwd'], 'serviceTier': 'default', 'config': {'features.memories': False}, **requested})
     ident = verify(result, provider)
+    permissions = permission_receipt(result, permission_mode, requested, expected)
     name = title_for(provider, source.get('name') or source.get('preview'))
     rpc.request('thread/name/set', {'threadId': ident, 'name': name})
     # Persist plaintext as model-visible user history, not transient runtime instructions.
@@ -394,7 +471,8 @@ def handoff_thread(rpc, source_id, provider, summary, model=None):
     if saved.get('modelProvider') != provider:
         raise RuntimeError(f'Handoff metadata verification failed: {ident}')
     return {'threadId': ident, 'sourceThreadId': source_id, 'provider': provider, 'name': name, 'mode': 'plaintext-handoff',
-            'verified': True, 'inferenceStarted': False, 'summarySha256': hashlib.sha256(summary.encode()).hexdigest()}
+            'verified': True, 'inferenceStarted': False, 'summarySha256': hashlib.sha256(summary.encode()).hexdigest(),
+            **permissions}
 
 
 def main():
@@ -414,6 +492,13 @@ def main():
     handoff.add_argument('--summary-file', type=Path, required=True); handoff.add_argument('--model')
     handoff.add_argument('--mode', choices=['session', 'persistent'], default='session')
     handoff.add_argument('--request-id')
+    for command in (branch, handoff):
+        command.add_argument('--permission-mode', choices=['config', 'inherit'], default='config',
+                             help='Use current effective config (default), or native source inheritance')
+        group = command.add_mutually_exclusive_group()
+        group.add_argument('--sandbox', choices=SANDBOX_TYPES)
+        group.add_argument('--permission-profile', help='Named permission profile, where supported by the server')
+        command.add_argument('--approval-policy', choices=['on-request', 'never'])
     args = parser.parse_args()
     if args.command == 'status':
         print(json.dumps(status(), ensure_ascii=False)); return
@@ -431,7 +516,9 @@ def main():
         folder = HOME / 'provider-fork/receipts'; folder.mkdir(parents=True, exist_ok=True)
         path = folder / (request_id + '.json')
         operation = {'sourceThreadId': args.thread, 'provider': provider, 'requestedModel': args.model,
-                     'requestedLastTurnId': getattr(args, 'last_turn', None), 'switchMode': args.mode}
+                     'requestedLastTurnId': getattr(args, 'last_turn', None), 'switchMode': args.mode,
+                     'permissionMode': args.permission_mode, 'requestedSandbox': args.sandbox,
+                     'requestedApprovalPolicy': args.approval_policy, 'requestedPermissionProfile': args.permission_profile}
         if args.command == 'handoff':
             summary = args.summary_file.read_text(encoding='utf-8-sig')
             operation['summarySha256'] = hashlib.sha256(summary.encode()).hexdigest()
@@ -448,9 +535,13 @@ def main():
         with path.open('x', encoding='utf-8') as f:
             json.dump({**operation, 'state': 'pending'}, f)
         if args.command == 'handoff':
-            receipt = handoff_thread(rpc, args.thread, provider, summary, args.model)
+            receipt = handoff_thread(rpc, args.thread, provider, summary, args.model,
+                permission_mode=args.permission_mode, sandbox=args.sandbox,
+                approval_policy=args.approval_policy, permission_profile=args.permission_profile)
         else:
-            receipt = fork(rpc, args.thread, provider, args.model, args.last_turn)
+            receipt = fork(rpc, args.thread, provider, args.model, args.last_turn,
+                permission_mode=args.permission_mode, sandbox=args.sandbox,
+                approval_policy=args.approval_policy, permission_profile=args.permission_profile)
         receipt.update(operation)
         if args.mode == 'persistent':
             persist_branch(receipt, provider, snapshot)

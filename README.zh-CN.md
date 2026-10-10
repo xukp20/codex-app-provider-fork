@@ -204,6 +204,41 @@ python skills/provider-fork/scripts/provider_fork.py default --provider official
 独立 stdio 进程不能接管被其他 writer 持有的会话。遇到写入锁时，应检查
 所属服务器并采用其可用传输。工具不会为了释放锁重启 App 或 daemon。
 
+### 权限设置
+
+Provider 切换与权限选择相互独立。默认的 `--permission-mode config` 采用源会话
+工作目录下当前的有效配置，包括项目配置层、命名权限 profile、细粒度审批策略
+与管理限制。服务器通过新建的 ephemeral 临时会话解析这些设置，随后立即取消
+订阅；它不保存会话历史，也不启动推理。脚本把解析出的权限显式传给新 fork，
+并核对实际返回值。
+
+这样可以避免在当前配置已经是 Full Access 时，仍把源分支旧的 `on-request`
+审批策略传给新分支。仅省略 RPC 的权限字段可能恢复源会话的已保存设置。
+如果希望采用这种原生行为，使用 `--permission-mode inherit`；sandbox/profile
+的恢复取决于已保存的数据和服务器版本。
+
+fork 和异常情况下的 handoff 都支持显式选项：
+
+```bash
+python skills/provider-fork/scripts/provider_fork.py fork \
+  --thread THREAD_ID --provider krill --sandbox danger-full-access \
+  --approval-policy never --request-id full-access-switch-001
+python skills/provider-fork/scripts/provider_fork.py fork \
+  --thread THREAD_ID --provider beeapi --sandbox read-only \
+  --approval-policy never --request-id readonly-switch-001
+```
+
+`--permission-profile PROFILE_ID` 可以选择命名权限 profile，与 `--sandbox`
+互斥。显式选项优先于所选权限模式，仍受服务器限制。回执包含
+`requestedPermissions`、`effectivePermissions` 和 `permissionsVerified`。
+需要同时核对 sandbox 和审批策略：[完整 Full Access](https://learn.chatgpt.com/docs/sandboxing)
+是 `danger-full-access` 加 `never`。Windows 的 `sandbox = "elevated"` 选择
+sandbox 实现，不会设定审批策略。
+
+这些选项不会修改全局审批/sandbox 配置，也不会修改已有分支。此前创建的分支
+需要单独调整权限。请求 ID 包含权限选项，改变选项时请使用新 ID；旧版回执
+不能证明实际权限已经核对。
+
 ## 安全边界
 
 - 不写入 `auth.json`，不复制官方 token，不直接编辑会话 JSONL/SQLite，
@@ -216,7 +251,7 @@ python skills/provider-fork/scripts/provider_fork.py default --provider official
   检测到并发配置编辑时停止替换。
 - 回执位于 `$CODEX_HOME/provider-fork/receipts/`。结果不确定时不自动重试；
   已成功的旧持久回执不会覆盖后来有意修改的默认值。
-- 新分支使用 `workspace-write`、`on-request` 审批、禁用 memories 和默认
+- 新分支使用解析出的配置或显式选择的权限、禁用 memories 和默认
   service tier。工具不会自动批准交互式服务器请求。这些权限不能强隔离
   不受信任的模型与本地凭据文件。
 - 继续推理时，fork 的历史会发送到选中的 Provider。切换前应检查敏感历史。
@@ -264,7 +299,8 @@ PROVIDER_FORK_NATIVE_TESTS=1 python -m unittest discover -s tests -v
 
 PowerShell 中先设置 `$env:PROVIDER_FORK_NATIVE_TESTS = '1'`，再运行相同的
 unittest 命令。原生测试覆盖 fork 后继续推理、专属 Authorization 请求头、
-配置/认证保持不变、重启恢复、恢复覆盖和持久回执恢复。
+配置/认证保持不变、重启恢复、恢复覆盖和持久回执恢复，以及源会话旧审批策略
+下的 Full Access 默认值、原生继承、显式受限权限和 profile 选择。
 
 ## 兼容性
 

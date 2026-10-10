@@ -124,7 +124,7 @@ class PersistentTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("PROVIDER_FORK_NATIVE_TESTS") == "1",
                          "Set PROVIDER_FORK_NATIVE_TESTS=1 to run isolated Codex integration tests")
     def test_cli_persistent_handoff_and_idempotent_retry(self):
-        self.write('model_provider="beeapi"\n')
+        self.write('model_provider="beeapi"\nsandbox_mode="danger-full-access"\napproval_policy="never"\n')
         with mod.Rpc('stdio') as rpc:
             source = rpc.request('thread/start', {'cwd': str(self.home), 'sandbox': 'read-only', 'approvalPolicy': 'never'})
             ident = mod.verify(source, 'beeapi')
@@ -137,6 +137,9 @@ class PersistentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
         self.assertTrue(receipt['verified']); self.assertTrue(receipt['persistentApplied'])
+        self.assertTrue(receipt['permissionsVerified'])
+        self.assertEqual(receipt['effectivePermissions']['approvalPolicy'], 'never')
+        self.assertEqual(receipt['effectivePermissions']['sandbox']['type'], 'dangerFullAccess')
         self.assertFalse(receipt['inferenceStarted'])
         self.assertEqual(mod.settings()['model_provider'], 'krill-code')
         mod.set_default('openai')
@@ -145,6 +148,10 @@ class PersistentTests(unittest.TestCase):
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(json.loads(replay.stdout)['threadId'], receipt['threadId'])
         self.assertEqual(mod.settings()['model_provider'], 'openai')
+        changed_permissions = subprocess.run(argv + ['--approval-policy', 'on-request'],
+            capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(changed_permissions.returncode, 1)
+        self.assertIn('different operation', changed_permissions.stderr)
         self.assertEqual((self.home / 'auth.json').read_bytes(), self.auth)
 
     @unittest.skipUnless(os.environ.get("PROVIDER_FORK_NATIVE_TESTS") == "1",
